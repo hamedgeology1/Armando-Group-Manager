@@ -1,0 +1,263 @@
+"""Background scheduler: due jobs, expiry handling and cleanup loops.
+
+Runs inside the bot process (no external worker required) and is safe for
+multi-instance deployments for the read-only jobs (statistics), while
+destructive expiries are idempotent.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+
+from aiogram import Bot
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..config import settings
+from ..core import cache
+from ..core import ratelimit
+from ..core.errors import safe_restrict, safe_unban
+from ..db import session_scope
+from ..db.models import (
+    Chat,
+    ChatMemberState,
+    ModerationAction,
+    ScheduledMessage,
+    Warning,
+)
+from . import antiflood, antiraid, captcha, personal, stats
+
+logger = logging.getLogger("armando.scheduler")
+
+
+def compute_next_run(message_row: ScheduledMessage, now: datetime | None = None) -> datetime | None:
+    """Compute the next execution time for a scheduled message."""
+    from ..core.timeutils import next_occurrence
+
+    now = now or datetime.utcnow()
+    if message_row.repeat_seconds:
+        return now + timedelta(seconds=int(message_row.repeat_seconds))
+    cron = (message_row.cron or "").strip()
+    if not cron:
+        return None
+    parts = cron.split(":")
+    try:
+        if parts[0] == "weekly" and len(parts) == 3:
+            weekday = int(parts[1])
+            hour, minute = (int(x) for x in parts[2].split(":"))
+            from ..core.timeutils import tehran_now
+
+            local_now = tehran_now()
+            candidate = next_occurrence(hour, minute, local_now)
+            while candidate.weekday() != weekday:
+                candidate = next_occurrence(hour, minute, candidate)
+            return candidate.astimezone(timezone.utc).replace(tzinfo=None)
+        # "HH:MM" daily
+        hour, minute = (int(x) for x in parts[0].split(":"))
+        from ..core.timeutils import tehran_now
+
+        candidate = next_occurrence(hour, minute, tehran_now())
+        return candidate.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:  # noqa: BLE001
+        logger.warning("invalid cron expression: %s", cron)
+        return None
+
+
+class SchedulerService:
+    """Periodic maintenance loop."""
+
+    def __init__(self, bot: Bot, tick: int | None = None) -> None:
+        self.bot = bot
+        self.tick = tick or settings.scheduler_tick
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._last_snapshot_day: dict[int, str] = {}
+
+    # ------------------------------------------------------------------ lifecycle
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run(), name="armando-scheduler")
+        logger.info("scheduler started (tick=%ss)", self.tick)
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._task = None
+        logger.info("scheduler stopped")
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self.tick_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001 - never kill the loop
+                logger.exception("scheduler tick failed: %s", exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.tick)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    # ---------------------------------------------------------------------- tick
+    async def tick_once(self) -> None:
+        async with session_scope() as session:
+            await self._run_scheduled(session)
+            await self._expire_captchas(session)
+            await self._expire_restrictions(session)
+            await self._expire_warnings(session)
+            await self._snapshot(session)
+        self._cleanup()
+
+    # ---------------------------------------------------------------------- jobs
+    async def _run_scheduled(self, session: AsyncSession) -> None:
+        now = datetime.utcnow()
+        result = await session.execute(
+            select(ScheduledMessage).where(ScheduledMessage.enabled.is_(True),
+                                           ScheduledMessage.next_run_at.is_not(None),
+                                           ScheduledMessage.next_run_at <= now)
+        )
+        rows = list(result.scalars().all())
+        for row in rows:
+            try:
+                from .render import send_content
+
+                await send_content(self.bot, row.chat_id, content_type="text",
+                                   text=row.text, file_id=(row.media or {}).get("file_id"),
+                                   caption=(row.media or {}).get("caption"),
+                                   buttons=row.buttons)
+                row.last_run_at = now
+                row.run_count = int(row.run_count or 0) + 1
+                row.next_run_at = compute_next_run(row, now)
+                if row.next_run_at is None:
+                    row.enabled = False
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("scheduled message %s failed: %s", row.id, exc)
+                row.next_run_at = now + timedelta(seconds=max(60, self.tick * 3))
+        if rows:
+            await session.flush()
+
+    async def _expire_captchas(self, session: AsyncSession) -> None:
+        try:
+            count = await captcha.expire_pending(self.bot, session)
+            if count:
+                logger.info("expired %s captcha sessions", count)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("captcha expiry job failed: %s", exc)
+
+    async def _expire_restrictions(self, session: AsyncSession) -> None:
+        now = datetime.utcnow()
+        result = await session.execute(
+            select(ModerationAction).where(ModerationAction.active.is_(True),
+                                           ModerationAction.expires_at.is_not(None),
+                                           ModerationAction.expires_at <= now,
+                                           ModerationAction.action.in_(["temp_ban", "temp_mute"]))
+        )
+        for row in result.scalars().all():
+            try:
+                if row.action == "temp_ban":
+                    ok = await safe_unban(self.bot, row.chat_id, row.target_id,
+                                          only_if_banned=True, context="auto_unban")
+                else:
+                    from .moderation import UNMUTE_PERMISSIONS
+
+                    ok = await safe_restrict(self.bot, row.chat_id, row.target_id,
+                                             UNMUTE_PERMISSIONS, context="auto_unmute")
+                if ok:
+                    row.active = False
+                    row.undone_at = now
+                    row.undone_by = self.bot.id
+                    state_result = await session.execute(
+                        select(ChatMemberState).where(ChatMemberState.chat_id == row.chat_id,
+                                                      ChatMemberState.user_id == row.target_id)
+                    )
+                    state = state_result.scalar_one_or_none()
+                    if state is not None:
+                        state.status = "member"
+                        state.muted_until = None
+                        state.restricted_until = None
+                    cache.invalidate_user(row.chat_id, row.target_id)
+                    logger.info("auto released %s for user %s in chat %s",
+                                row.action, row.target_id, row.chat_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("expiry of action %s failed: %s", row.id, exc)
+        await session.flush()
+
+    async def _expire_warnings(self, session: AsyncSession) -> None:
+        now = datetime.utcnow()
+        result = await session.execute(
+            select(Warning).where(Warning.active.is_(True), Warning.expires_at.is_not(None),
+                                  Warning.expires_at <= now)
+        )
+        rows = list(result.scalars().all())
+        for row in rows:
+            row.active = False
+            row.removed_at = now
+            row.removed_by = self.bot.id
+            state_result = await session.execute(
+                select(ChatMemberState).where(ChatMemberState.chat_id == row.chat_id,
+                                              ChatMemberState.user_id == row.user_id)
+            )
+            state = state_result.scalar_one_or_none()
+            if state is not None and int(state.warn_count or 0) > 0:
+                state.warn_count = int(state.warn_count) - 1
+            cache.invalidate_user(row.chat_id, row.user_id)
+        if rows:
+            await session.flush()
+            logger.info("expired %s warnings", len(rows))
+
+    async def _snapshot(self, session: AsyncSession) -> None:
+        today = datetime.utcnow().date().isoformat()
+        result = await session.execute(
+            select(Chat).where(Chat.is_active.is_(True)).order_by(Chat.last_seen_at.desc()).limit(200)
+        )
+        for chat in result.scalars().all():
+            if self._last_snapshot_day.get(chat.id) == today:
+                continue
+            try:
+                await stats.snapshot(session, chat.id, self.bot)
+                self._last_snapshot_day[chat.id] = today
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("snapshot failed for %s: %s", chat.id, exc)
+        await session.flush()
+
+    # ------------------------------------------------------------------ cleanup
+    def _cleanup(self) -> None:
+        try:
+            cache.cleanup_all()
+            ratelimit.prune_all()
+            antiflood.tracker.prune()
+            antiraid.raid_tracker.prune()
+            personal.prune_cooldowns()
+            from ..services import entertainment
+
+            entertainment.guess_game.cleanup()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cleanup failed: %s", exc)
+
+
+scheduler_service: SchedulerService | None = None
+
+
+async def start_scheduler(bot: Bot) -> SchedulerService:
+    global scheduler_service
+    scheduler_service = SchedulerService(bot)
+    await scheduler_service.start()
+    return scheduler_service
+
+
+async def stop_scheduler() -> None:
+    global scheduler_service
+    if scheduler_service is not None:
+        await scheduler_service.stop()
+        scheduler_service = None

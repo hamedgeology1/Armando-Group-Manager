@@ -1,0 +1,26 @@
+# Armando Group Manager - dependencies
+# Python 3.12+ (see runtime.txt)
+
+# Telegram framework
+aiogram==3.31.0
+
+# Database: SQLAlchemy 2.x (async) + SQLite driver
+SQLAlchemy==2.0.36
+aiosqlite==0.20.0
+greenlet==3.1.1
+
+# Postgres driver (optional: only needed when DATABASE_URL points at Postgres)
+asyncpg==0.30.0
+
+# HTTP: webhook server + market/price providers
+aiohttp==3.11.10
+
+# Persian calendar (jalali dates)
+jdatetime==5.0.0
+
+# .env support
+python-dotenv==1.0.1
+
+# ------------------------------------------------------------------ testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
