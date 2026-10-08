@@ -12,6 +12,8 @@ from typing import Any, Callable
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..core.normalization import to_persian_digits
+from ..services.chatlock import MODE_LABELS
+from ..services.leave_guard import status_text as leave_status_text
 from ..services.locks import LOCK_GROUPS, LOCK_REGISTRY
 from ..services.moderation import PUNISHMENT_OPTIONS_FA
 from ..services.roles import level_of
@@ -245,6 +247,7 @@ def _panel_security(ctx: dict) -> tuple[str, InlineKeyboardMarkup]:
 
 def _panel_locks(ctx: dict) -> tuple[str, InlineKeyboardMarkup]:
     locks = ctx.get("locks") or {}
+    settings = ctx.get("settings") or {}
     page = ctx.get("lock_page") or "links"
     keys = [k for k, spec in LOCK_REGISTRY.items() if spec.group == page]
     lines = [f"🔒 <b>قفل‌ها — {LOCK_GROUPS.get(page, page)}</b>", ""]
@@ -257,6 +260,12 @@ def _panel_locks(ctx: dict) -> tuple[str, InlineKeyboardMarkup]:
                      + (f"  (🎯 {PUNISHMENT_OPTIONS_FA.get(action, action)})" if enabled else ""))
     lines.append("")
     lines.append("برای تغییر، روی نام قفل بزنید؛ سپس نوع برخورد را انتخاب کنید.")
+    lines.append("")
+    lines.append("🔒 <b>قفل کلی گروه</b> (دسترسی ارسال اعضا در تلگرام)")
+    lines.append(f"وضعیت: {MODE_LABELS.get(ctx.get('chat_lock') or 'off', '—')}")
+    lines.append("")
+    lines.append("🚪 <b>قفل خروج</b>")
+    lines.append(leave_status_text(settings))
 
     buttons = []
     for key in keys:
@@ -267,6 +276,20 @@ def _panel_locks(ctx: dict) -> tuple[str, InlineKeyboardMarkup]:
                              cb("lock", "toggle", key, page)))
     rows = grid(buttons, per_row=2)
 
+    rows.append([danger("🔒 قفل گروه", cb("cl", "all")),
+                 primary("🖼 قفل رسانه", cb("cl", "media")),
+                 success("🔓 باز کردن گروه", cb("cl", "off"))])
+    leave_rows = [
+        [toggle_button("🚪 بن هنگام خروج", "ban_on_leave",
+                       bool(settings.get("ban_on_leave")), "locks"),
+         toggle_button("⚡️ خروج سریع", "quick_leave_ban",
+                       bool(settings.get("quick_leave_ban")), "locks")],
+    ]
+    if settings.get("quick_leave_ban"):
+        leave_rows.append(number_buttons("ثانیه", "quick_leave_seconds",
+                                         int(settings.get("quick_leave_seconds") or 10),
+                                         "locks", step=5, minimum=3, maximum=600))
+    rows.extend(leave_rows)
     group_buttons = [primary(LOCK_GROUPS[g], cb("lockpage", g)) for g in LOCK_GROUPS]
     rows.append(group_buttons)
     rows.append([danger("🧹 غیرفعال‌سازی همه قفل‌ها", cb("conf", "clearlocks", "all"))])
@@ -290,11 +313,21 @@ def _panel_lock_detail(ctx: dict) -> tuple[str, InlineKeyboardMarkup]:
     if spec and spec.threshold:
         value = int((state.extra or {}).get(spec.threshold_field or "", spec.default_threshold)) if state else spec.default_threshold
         lines.append(f"حد مجاز: {to_persian_digits(str(value))}")
-    keyboard = markup([
+    rows = [
         [onoff(f"{'🟢 فعال' if enabled else '🔴 خاموش'}", enabled, cb("lock", "toggle", key, ctx.get('lock_page') or 'links'))],
         *action_selector("lock", f"action:{key}", action, options=PUNISHMENT_OPTIONS_FA, prefix="lockact"),
-        row(home()),
-    ])
+    ]
+    if spec and spec.threshold:
+        field = spec.threshold_field or "value"
+        value = int((state.extra or {}).get(field, spec.default_threshold)) if state else spec.default_threshold
+        step = 500 if value >= 1000 else (5 if value <= 50 else 50)
+        rows.append([
+            primary("➖", cb("locknum", key, field, -step, ctx.get("lock_page") or "links")),
+            btn(f"حد مجاز: {to_persian_digits(str(value))}", cb("noop")),
+            success("➕", cb("locknum", key, field, step, ctx.get("lock_page") or "links")),
+        ])
+    rows.append(row(home()))
+    keyboard = markup(rows)
     return "\n".join(lines), keyboard
 
 
@@ -993,6 +1026,7 @@ def help_text(topic: str) -> str:
         "mod": "\n".join([
             "🛡 <b>مدیریت کاربران</b>", "",
             "• <code>بن</code> / <code>بن ۲روز دلیل</code> / <code>رفع بن</code>",
+            "• با ریپلای، یا با نام‌کاربری/شناسه: <code>لغو سکوت @username</code>",
             "• <code>کیک</code> / <code>سکوت</code> / <code>سکوت ۳۰دقیقه</code> / <code>لغو سکوت</code>",
             "• <code>اخطار دلیل</code> / <code>کسر اخطار</code> / <code>صفر کردن اخطار</code>",
             "• <code>تعداد اخطار ۴</code> / <code>وضعیت اخطار</code> / <code>تاریخچه</code>",
@@ -1003,6 +1037,13 @@ def help_text(topic: str) -> str:
             "• <code>قفل لینک</code> / <code>بازکردن لینک</code>",
             "• <code>قفل عکس</code> / <code>قفل ویدیو</code> / <code>قفل استیکر</code> / <code>قفل فوروارد</code>",
             "• <code>قفل فحاشی</code> / <code>قفل پورن</code> / <code>قفل انگلیسی</code>",
+            "• <code>قفل چینی</code> / <code>قفل روسی</code> / <code>قفل هندی</code>",
+            "• <code>قفل طولانی</code> (پیامِ بیش از ۱۰۰۰ کاراکتر → حذف + سکوت)",
+            "• <code>قفل کانال</code> (ارسال ناشناس با کانال → حذف + مسدود کردن کانال)",
+            "• <code>قفل گروه</code> / <code>قفل گروه رسانه</code> / <code>باز کردن گروه</code>",
+            "• <code>قفل خروج</code> (بن خودکار هرکس خارج شود)",
+            "• <code>بن خروج سریع ۱۰</code> (بنِ خروجِ بلافاصله پس از ورود)",
+            "• <code>وضعیت قفل گروه</code>",
             "• برای مشاهده همه قفل‌ها: <code>لیست قفل‌ها</code> یا پنل «🔒 قفل‌ها»",
         ]),
         "filters": "\n".join([

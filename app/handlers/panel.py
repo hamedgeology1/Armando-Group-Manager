@@ -16,7 +16,8 @@ from aiogram.types import (CallbackQuery, ChatMemberAdministrator, ChatMemberOwn
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..core.errors import safe_answer, safe_delete, safe_edit
+from ..core import cache
+from ..core.errors import safe_answer, safe_call, safe_delete, safe_edit
 from ..core.normalization import to_persian_digits
 from ..db.models import (
     BotRole,
@@ -144,6 +145,9 @@ async def _prepare_ctx(session: AsyncSession, bot: Bot, chat_id: int, user_id: i
         ctx["lock_page"] = extra.get("lock_page", "links")
     if section == "locks":
         ctx["lock_page"] = extra.get("lock_page", "links")
+        from ..services import chatlock
+
+        ctx["chat_lock"] = await chatlock.chat_lock_state(bot, chat_id)
     if section == "filters":
         rules = await filter_service.get_rules(session, chat_id)
         notes = await note_service.list_notes(session, chat_id)
@@ -280,8 +284,23 @@ async def send_panel(bot: Bot, chat_id: int, user_id: int, session: AsyncSession
     ctx = await _prepare_ctx(session, bot, target_chat_id, user_id, actor, settings, section,
                              chat_title=(chat.title if chat else ""), chat_type="group", **extra)
     text, keyboard = build_panel(section, ctx)
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard,
-                           parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard,
+                                  parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    if sent is not None:
+        remember_panel_owner(chat_id, sent.message_id, user_id)
+
+
+PANEL_TTL = 24 * 60 * 60  # a day is plenty for an interactive panel
+
+
+def remember_panel_owner(chat_id: int, message_id: int, user_id: int) -> None:
+    """Bind a panel message to the admin who opened it."""
+    cache.panel_owner_cache.set((chat_id, message_id), int(user_id))
+
+
+def _panel_owner(chat_id: int, message_id: int) -> int | None:
+    owner = cache.panel_owner_cache.get((chat_id, message_id))
+    return int(owner) if owner is not None else None
 
 
 def _role_key(actor) -> str:
@@ -334,7 +353,9 @@ async def _refresh(callback: CallbackQuery, session: AsyncSession, bot: Bot, cha
                              chat_type=callback.message.chat.type if callback.message else "group",
                              **extra)
     text, keyboard = build_panel(section, ctx)
-    await safe_edit(callback.message, text, reply_markup=keyboard)
+    edited = await safe_edit(callback.message, text, reply_markup=keyboard)
+    if edited is not None and callback.message is not None:
+        remember_panel_owner(chat_id, callback.message.message_id, callback.from_user.id)
 
 
 # --------------------------------------------------------------------------- #
@@ -663,6 +684,174 @@ async def on_warn_action(callback: CallbackQuery, session: AsyncSession, bot: Bo
     await safe_edit(callback.message, text)
 
 
+@router.callback_query(F.data.startswith("locknum:"))
+async def on_lock_number(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
+    """Change the threshold of a lock (e.g. the 1000 character limit)."""
+    parts = parse_cb(callback.data or "")
+    # locknum:<key>:<field>:<delta>[:<page>]
+    if len(parts) < 4:
+        await safe_answer(callback)
+        return
+    key, field, raw_delta = parts[1], parts[2], parts[3]
+    page = parts[4] if len(parts) > 4 else "links"
+    try:
+        delta = int(raw_delta)
+    except ValueError:
+        await safe_answer(callback)
+        return
+    chat_id = await _panel_chat_id(callback, session)
+    if not await _ensure_admin(callback, bot, chat_id, session):
+        return
+    spec = lock_service.LOCK_REGISTRY.get(key)
+    if spec is None or not spec.threshold:
+        await safe_answer(callback)
+        return
+    locks = await lock_service.get_locks_map(session, chat_id)
+    state = locks.get(key)
+    current = int((state.extra or {}).get(field, spec.default_threshold)) if state \
+        else spec.default_threshold
+    value = max(1, min(100000, current + delta))
+    await lock_service.set_lock(session, chat_id, key,
+                                bool(state.enabled) if state else True,
+                                action=(state.action if state else None),
+                                extra={field: value}, updated_by=callback.from_user.id)
+    await safe_answer(callback, f"✅ {to_persian_digits(str(value))}")
+    await _refresh(callback, session, bot, chat_id, "lock", lock_key=key, lock_page=page)
+
+
+@router.callback_query(F.data.startswith("lg:"))
+async def on_leave_guard(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
+    """Disable a «قفل خروج» rule straight from the ban notice."""
+    from ..services.chat_state import get_settings, invalidate_settings
+
+    parts = parse_cb(callback.data or "")
+    if len(parts) < 3:
+        await safe_answer(callback)
+        return
+    action, field = parts[1], parts[2]
+    chat_id = await _panel_chat_id(callback, session)
+    if not await _ensure_admin(callback, bot, chat_id, session):
+        return
+    if action != "off" or field not in {"ban_on_leave", "quick_leave_ban"}:
+        await safe_answer(callback)
+        return
+    settings_obj = await get_settings(session, chat_id)
+    setattr(settings_obj, field, False)
+    invalidate_settings(chat_id)
+    await session.flush()
+    await safe_answer(callback, "⛔️ قانون خاموش شد.")
+    if callback.message:
+        label = "بن هنگام خروج" if field == "ban_on_leave" else "بن خروج سریع"
+        await safe_edit(callback.message,
+                        f"⛔️ «{label}» خاموش شد.\n"
+                        f"از این لحظه کسی به‌خاطر خروج بن نمی‌شود.\n\n"
+                        f"برای روشن کردن دوباره: <code>قفل خروج</code>")
+
+
+@router.callback_query(F.data.startswith("undo:"))
+async def on_undo(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
+    """Reverse the moderation action the button was attached to."""
+    from ..core.telegram_extra import call_api_raw
+    from ..keyboards.menus import RIGHT_PRESETS
+    from ..services import moderation as mod
+    from ..services import tags as tag_service
+    from ..services.chat_state import invalidate_member
+
+    parts = parse_cb(callback.data or "")
+    if len(parts) < 3:
+        await safe_answer(callback)
+        return
+    action, raw_user = parts[1], parts[2]
+    user_id = int(raw_user) if raw_user.isdigit() else 0
+    chat_id = await _panel_chat_id(callback, session)
+    actor = await permissions.build_actor(bot, chat_id, callback.from_user.id, session=session)
+    if not user_id:
+        await safe_answer(callback)
+        return
+
+    if action == "unmute":
+        if not actor.can_restrict():
+            await safe_answer(callback, "⛔️ شما اجازه «محدود کردن اعضا» را ندارید.",
+                              show_alert=True)
+            return
+        text = await mod.unmute_user(bot, session, chat_id=chat_id, actor=actor,
+                                     target_id=user_id, target_name=str(user_id),
+                                     reason="لغو از دکمه")
+    elif action == "unban":
+        if not actor.can_ban():
+            await safe_answer(callback, "⛔️ شما اجازه «بن/رفع بن» را ندارید.", show_alert=True)
+            return
+        text = await mod.unban_user(bot, session, chat_id=chat_id, actor=actor,
+                                    target_id=user_id, target_name=str(user_id),
+                                    reason="لغو از دکمه")
+    elif action == "unwarn":
+        if not (actor.can_ban() or actor.can_restrict() or actor.has_role("moderator")):
+            await safe_answer(callback, "⛔️ شما اجازه این کار را ندارید.", show_alert=True)
+            return
+        text = await mod.unwarn_user(bot, session, chat_id=chat_id, actor=actor,
+                                     target_id=user_id, target_name=str(user_id))
+    elif action == "demote":
+        if not actor.can_promote():
+            await safe_answer(callback, "⛔️ فقط مدیران گروه می‌توانند مدیر عزل کنند.",
+                              show_alert=True)
+            return
+        if not await permissions.bot_has_right(bot, chat_id, "can_promote_members"):
+            await safe_answer(callback, "⚠️ ربات دسترسی «افزودن مدیر جدید» را ندارد.",
+                              show_alert=True)
+            return
+        payload = {"chat_id": chat_id, "user_id": user_id, "can_manage_chat": True,
+                   **RIGHT_PRESETS["none"]}
+        if not await call_api_raw(bot, "promoteChatMember", payload):
+            await safe_answer(callback, "⚠️ تلگرام این تغییر را نپذیرفت.", show_alert=True)
+            return
+        invalidate_member(chat_id, user_id)
+        text = "↩️ مدیر عزل شد و همهٔ دسترسی‌های او گرفته شد."
+    elif action == "deltag":
+        if not actor.can_manage_settings():
+            await safe_answer(callback, "⛔️ فقط مدیران گروه می‌توانند تگ را حذف کنند.",
+                              show_alert=True)
+            return
+        await tag_service.set_tag(session, chat_id, user_id, None)
+        await tag_service.apply_member_tag(bot, chat_id, user_id, None)
+        text = "↩️ تگ کاربر حذف شد."
+    else:
+        await safe_answer(callback)
+        return
+
+    await safe_answer(callback)
+    if callback.message:
+        await safe_edit(callback.message, f"↩️ <b>لغو شد</b>\n\n{text}")
+
+
+@router.callback_query(F.data.startswith("cl:"))
+async def on_chat_lock(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
+    """قفل گروه / باز کردن گروه straight from the locks panel."""
+    from ..services import chatlock
+
+    parts = parse_cb(callback.data or "")
+    mode = parts[1] if len(parts) > 1 else ""
+    chat_id = await _panel_chat_id(callback, session)
+    actor = await permissions.build_actor(bot, chat_id, callback.from_user.id, session=session)
+    if not actor.can_restrict():
+        await safe_answer(callback, "⛔️ شما اجازه «محدود کردن اعضا» را ندارید.", show_alert=True)
+        return
+    if mode not in chatlock.MODES:
+        await safe_answer(callback)
+        return
+    if not await permissions.bot_has_right(bot, chat_id, "can_restrict_members"):
+        await safe_answer(callback, "⚠️ ربات دسترسی «محدود کردن اعضا» را ندارد.", show_alert=True)
+        return
+    if not await chatlock.apply_chat_lock(bot, chat_id, mode):
+        await safe_answer(callback, "⚠️ تلگرام این تغییر را نپذیرفت.", show_alert=True)
+        return
+    await safe_answer(callback, "✅ اعمال شد.")
+    if callback.message:
+        state = await chatlock.chat_lock_state(bot, chat_id)
+        await safe_edit(callback.message,
+                        f"{chatlock.MODE_MESSAGES[mode]}\n\n"
+                        f"وضعیت کنونی: {chatlock.MODE_LABELS[state]}")
+
+
 @router.callback_query(F.data.startswith("ap:"))
 async def on_admin_rights(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
     """Toggle the Telegram administrator rights of one admin, live."""
@@ -873,3 +1062,28 @@ async def _ensure_admin(callback: CallbackQuery, bot: Bot, chat_id: int,
     await safe_answer(callback, "⛔️ فقط مدیران گروه می‌توانند تنظیمات را تغییر دهند.",
                       show_alert=True)
     return False
+
+
+@router.callback_query.middleware()
+async def panel_owner_middleware(handler, event: CallbackQuery, data: dict):
+    """A panel belongs to the admin who opened it - nobody else may click it.
+
+    Every panel message is remembered when it is sent; clicking it from another
+    account is refused with an alert instead of silently changing the group.
+    """
+    message = getattr(event, "message", None)
+    user = getattr(event, "from_user", None)
+    if message is not None and user is not None:
+        owner = _panel_owner(message.chat.id, message.message_id)
+        if owner is not None and owner != user.id:
+            bot = data.get("bot")
+            if bot is not None:
+                await safe_call(
+                    lambda: bot.answer_callback_query(
+                        callback_query_id=event.id,
+                        text=("\U0001f512 این پنل مخصوص مدیری است که آن را باز کرده است.\n"
+                              "برای پنل خودتان در گروه دستور «پنل» را بزنید."),
+                        show_alert=True),
+                    default=None, context="panel_owner_denied")
+            return None
+    return await handler(event, data)
