@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 
 from aiogram import Bot, F, Router
@@ -10,7 +11,7 @@ from aiogram.types import (CallbackQuery, ChatJoinRequest, ChatMemberUpdated, Me
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings as app_settings
-from ..core.errors import safe_delete, safe_restrict, safe_send
+from ..core.errors import safe_delete, safe_restrict, safe_send, schedule_delete
 from ..core.normalization import to_persian_digits
 from ..db.models import Chat
 from ..services import antiraid, captcha, connection as connection_service
@@ -58,18 +59,18 @@ async def _joined_at(session: AsyncSession, chat_id: int, user_id: int):
 
 async def _leave_guard(bot: Bot, session: AsyncSession, chat_id: int, user,
                        settings: dict, joined_at,
-                       member_status: str | None = None) -> None:
-    """Ban members who leave, and explain it with one-tap undo buttons."""
+                       member_status: str | None = None):
+    """Ban members who leave; return the reason and the group notice message."""
     if not leave_guard.is_enabled(settings):
-        return
+        return None, None
     reason = await leave_guard.check_leave(bot, chat_id, user.id, settings, joined_at,
                                            session=session, member_status=member_status)
     if reason is None:
-        return
+        return None, None
     from ..keyboards.factory import cb, markup, primary, row, success
 
     rule = "ban_on_leave" if settings.get("ban_on_leave") else "quick_leave_ban"
-    name = (user.full_name or "").strip() or str(user.id)
+    name = html.escape((user.full_name or "").strip() or str(user.id))
     text = ("🚪 <b>قفل خروج</b>\n\n"
             f"<a href=\"tg://user?id={user.id}\">{name}</a> گروه را ترک کرد و "
             f"طبق تنظیمات بن شد.\n"
@@ -79,7 +80,8 @@ async def _leave_guard(bot: Bot, session: AsyncSession, chat_id: int, user,
          primary("⛔️ خاموش کردن این قانون", cb("lg", "off", rule))],
         row(primary("🏠 پنل", cb("nav", "home"))),
     ])
-    await safe_send(bot, chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+    notice = await safe_send(bot, chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+    return reason, notice
 
 
 @router.message(F.new_chat_members)
@@ -191,13 +193,22 @@ async def on_chat_member(update: ChatMemberUpdated, session: AsyncSession, bot: 
     # The structured chat_member update is the reliable signal for a voluntary
     # departure. Run the leave guard only for ordinary members; never treat an
     # administrator's departure or an admin-issued kick as an automatic ban.
-    left_voluntarily = (old.status in {"member", "restricted"}
+    left_voluntarily = (update.chat.type in {"group", "supergroup"}
+                        and old.status in {"member", "restricted"}
                         and new.status == "left")
     if left_voluntarily:
         leave_settings = await get_settings_cached(session, update.chat.id)
         joined_at = await _joined_at(session, update.chat.id, user.id)
-        await _leave_guard(bot, session, update.chat.id, user,
-                           leave_settings, joined_at, member_status=old.status)
+        ban_reason, group_notice = await _leave_guard(
+            bot, session, update.chat.id, user, leave_settings, joined_at,
+            member_status=old.status)
+        if leave_settings.get("leave_notify_owner"):
+            delivered = await leave_guard.notify_leave_event(
+                bot, session, chat=update.chat, user=user,
+                settings=leave_settings, ban_reason=ban_reason)
+            if delivered and group_notice is not None:
+                schedule_delete(bot, update.chat.id, group_notice.message_id, 60,
+                                context="leave_private_report_delivered")
 
     # Every status change teaches the bot about a member (somebody who is
     # muted, promoted or restricted is often a member who never speaks).

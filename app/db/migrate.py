@@ -98,6 +98,24 @@ async def _migration_9(engine: AsyncEngine) -> None:
 
 MIGRATIONS[9] = _migration_9
 
+
+async def _migration_10(engine: AsyncEngine) -> None:
+    """Store the independent per-group AI chat model selection."""
+    await add_column(engine, "chat_settings", "ai_chat_model",
+                     "VARCHAR(200) NOT NULL DEFAULT ''")
+
+
+MIGRATIONS[10] = _migration_10
+
+
+async def _migration_11(engine: AsyncEngine) -> None:
+    """Enable optional private notifications for group leave events."""
+    await add_column(engine, "chat_settings", "leave_notify_owner",
+                     "BOOLEAN NOT NULL DEFAULT 0")
+
+
+MIGRATIONS[11] = _migration_11
+
 CURRENT_VERSION = max(MIGRATIONS) if MIGRATIONS else 0
 
 

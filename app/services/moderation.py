@@ -200,13 +200,16 @@ async def ban_user(bot: Bot, session: AsyncSession, *, chat_id: int, actor: Acto
                   target_id: int, target_name: str = "", duration: int | None = None,
                   reason: str = "", delete_message_id: int | None = None,
                   chat_title: str = "", source: str = "command") -> str:
-    if source in {"command", "panel"}:
+    if source in {"command", "panel", "multi_ban"}:
         denied = await _manual_action_error(bot, session, chat_id=chat_id,
                                             actor=actor, target_id=target_id)
         if denied:
             return denied
     until = datetime.utcnow() + timedelta(seconds=duration) if duration else None
     ok = await safe_ban(bot, chat_id, target_id, until_date=until, context="ban")
+    if not ok:
+        # Never create an active ban record when Telegram rejected the ban.
+        return "⚠️ عملیات در تلگرام انجام نشد (احتمالاً دسترسی ربات ناکافی است)."
 
     action = "temp_ban" if duration else "ban"
     await record_action(session, chat_id=chat_id, action=action, target_id=target_id,
@@ -230,8 +233,6 @@ async def ban_user(bot: Bot, session: AsyncSession, *, chat_id: int, actor: Acto
         chat_title=chat_title, reason=reason,
         duration=format_duration(duration) if duration else "",
     )
-    if not ok:
-        return "⚠️ عملیات در تلگرام انجام نشد (احتمالاً دسترسی ربات ناکافی است)."
     text = (f"🔨 کاربر {mention(target_id, target_name or await _display_name(session, target_id))} "
             f"{'به‌مدت ' + format_duration(duration) + ' ' if duration else ''}بن شد.")
     if reason:
