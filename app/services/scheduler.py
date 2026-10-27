@@ -148,6 +148,12 @@ class SchedulerService:
             await self._expire_restrictions(session)
             await self._expire_warnings(session)
             await self._snapshot(session)
+            try:
+                from .ai_memory import purge_expired_memory
+
+                await purge_expired_memory(session)
+            except Exception as exc:  # noqa: BLE001 - memory cleanup must not stop other jobs
+                logger.warning("AI group-memory cleanup failed: %s", exc.__class__.__name__)
         self._cleanup()
 
     # ---------------------------------------------------------------------- jobs

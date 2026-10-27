@@ -45,7 +45,7 @@ def status_text(settings: dict) -> str:
         seconds = int(settings.get("quick_leave_seconds") or 10)
         parts.append(f"خروج تا {to_persian_digits(str(seconds))} ثانیه پس از ورود → بن")
     if settings.get("leave_notify_owner"):
-        parts.append("گزارش خصوصی خروج روشن")
+        parts.append("گزارش خصوصی خروج‌های بدون بن روشن")
     if not parts:
         return "🔓 قفل خروج و گزارش خصوصی خاموش‌اند"
     return "🚪 " + " • ".join(parts)
@@ -115,7 +115,8 @@ async def notify_leave_event(bot: Bot, session, *, chat, user, settings: dict,
 
 async def check_leave(bot: Bot, chat_id: int, user_id: int, settings: dict,
                       joined_at: datetime | None = None,
-                      session=None, member_status: str | None = None) -> str | None:
+                      session=None, member_status: str | None = None,
+                      chat_title: str = "") -> str | None:
     """Ban the member if a leave rule fires; return the Persian reason or None.
 
     ``session`` lets the guard write a ``ban_records`` row.  Without it the bot
@@ -171,5 +172,14 @@ async def check_leave(bot: Bot, chat_id: int, user_id: int, settings: dict,
         except Exception as exc:  # noqa: BLE001 - never lose the ban itself
             logger.warning("could not record the leave-guard ban: %s", exc)
 
+    try:
+        from .ban_reports import report_successful_ban
+
+        await report_successful_ban(
+            bot, session, chat_id=chat_id, target_id=user_id, actor_id=bot.id,
+            reason=reason, source="leave_guard", target_name=str(user_id),
+            chat_title=chat_title)
+    except Exception as exc:  # noqa: BLE001 - a report must never undo a successful ban
+        logger.warning("leave-ban private report failed (%s)", exc.__class__.__name__)
     logger.info("کاربر %s در گروه %s به‌دلیل خروج بن شد (%s)", user_id, chat_id, reason)
     return reason

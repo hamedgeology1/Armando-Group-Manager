@@ -22,7 +22,9 @@ from .db.base import dispose_engine, init_db
 from .handlers import build_routers
 from .logging_setup import setup_logging
 from .middlewares import (ChatTrackingMiddleware, DbSessionMiddleware,
-                         GroupApprovalMiddleware, ThrottlingMiddleware)
+                         GroupApprovalMiddleware, GroupMemoryMiddleware,
+                         ThrottlingMiddleware)
+from .core.message_lifecycle import GroupMessageAutoDeleteMiddleware
 from .services.broadcast import MediaGroupCacheMiddleware
 from .services.market import close_http_session
 from .services.scheduler import start_scheduler, stop_scheduler
@@ -49,6 +51,11 @@ def build_dispatcher() -> Dispatcher:
     dispatcher.update.outer_middleware(ThrottlingMiddleware())
     dispatcher.message.outer_middleware(MediaGroupCacheMiddleware())
     dispatcher.message.middleware(ChatTrackingMiddleware())
+    dispatcher.message.middleware(GroupMemoryMiddleware())
+    for observer in (dispatcher.edited_message, dispatcher.channel_post,
+                     dispatcher.edited_channel_post):
+        observer.middleware(ChatTrackingMiddleware())
+        observer.middleware(GroupMemoryMiddleware())
     dispatcher.callback_query.middleware(ChatTrackingMiddleware())
 
     for router in build_routers():
@@ -130,6 +137,7 @@ async def run() -> None:
               default=DefaultBotProperties(parse_mode=ParseMode.HTML,
                                            link_preview_is_disabled=True,
                                            protect_content=False))
+    bot.session.middleware.register(GroupMessageAutoDeleteMiddleware())
     dispatcher = build_dispatcher()
     await register_bot_commands(bot)
     await start_scheduler(bot)

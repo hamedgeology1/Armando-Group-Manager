@@ -14,6 +14,7 @@ from aiogram.types import CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.errors import safe_answer, safe_edit
+from ..core.message_lifecycle import GROUP_BOT_MESSAGE_TTL
 from ..core.normalization import normalize_digits, to_persian_digits
 from ..keyboards.factory import cb, danger, markup, parse_cb, primary
 from ..services import moderation as moderation_service
@@ -26,7 +27,7 @@ router = Router(name="multi_ban")
 logger = logging.getLogger("armando.handlers.multi_ban")
 
 MAX_MULTIBAN_TARGETS = 25
-_DRAFT_TTL_SECONDS = 300
+_DRAFT_TTL_SECONDS = GROUP_BOT_MESSAGE_TTL
 _MAX_DRAFTS = 100
 _ID_RE = re.compile(r"^\d{5,15}$")
 _USERNAME_RE = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
@@ -195,7 +196,7 @@ async def cmd_multi_ban(ctx: CommandContext) -> None:
     )
     _DRAFTS[token] = draft
     preview = _format_preview(ctx.chat_title, accepted, rejected, invalid, draft.reason)
-    await ctx.reply(preview, reply_markup=_preview_keyboard(token), delete_after=_DRAFT_TTL_SECONDS)
+    await ctx.reply(preview, reply_markup=_preview_keyboard(token))
     await ctx.delete_invocation()
 
 

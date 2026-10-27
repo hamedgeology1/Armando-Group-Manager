@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings as app_settings
 from ..core.errors import safe_delete, safe_restrict, safe_send, schedule_delete
+from ..core.message_lifecycle import GROUP_BOT_MESSAGE_TTL
 from ..core.normalization import to_persian_digits
 from ..db.models import Chat
 from ..services import antiraid, captcha, connection as connection_service
@@ -59,12 +60,13 @@ async def _joined_at(session: AsyncSession, chat_id: int, user_id: int):
 
 async def _leave_guard(bot: Bot, session: AsyncSession, chat_id: int, user,
                        settings: dict, joined_at,
-                       member_status: str | None = None):
+                       member_status: str | None = None, chat_title: str = ""):
     """Ban members who leave; return the reason and the group notice message."""
     if not leave_guard.is_enabled(settings):
         return None, None
-    reason = await leave_guard.check_leave(bot, chat_id, user.id, settings, joined_at,
-                                           session=session, member_status=member_status)
+    reason = await leave_guard.check_leave(
+        bot, chat_id, user.id, settings, joined_at, session=session,
+        member_status=member_status, chat_title=chat_title)
     if reason is None:
         return None, None
     from ..keyboards.factory import cb, markup, primary, row, success
@@ -201,14 +203,35 @@ async def on_chat_member(update: ChatMemberUpdated, session: AsyncSession, bot: 
         joined_at = await _joined_at(session, update.chat.id, user.id)
         ban_reason, group_notice = await _leave_guard(
             bot, session, update.chat.id, user, leave_settings, joined_at,
-            member_status=old.status)
-        if leave_settings.get("leave_notify_owner"):
-            delivered = await leave_guard.notify_leave_event(
+            member_status=old.status, chat_title=update.chat.title or "")
+        if group_notice is not None:
+            schedule_delete(bot, update.chat.id, group_notice.message_id,
+                            GROUP_BOT_MESSAGE_TTL,
+                            context="leave_ban_notice_autodelete")
+        if leave_settings.get("leave_notify_owner") and ban_reason is None:
+            await leave_guard.notify_leave_event(
                 bot, session, chat=update.chat, user=user,
-                settings=leave_settings, ban_reason=ban_reason)
-            if delivered and group_notice is not None:
-                schedule_delete(bot, update.chat.id, group_notice.message_id, 60,
-                                context="leave_private_report_delivered")
+                settings=leave_settings, ban_reason=None)
+
+    # Report bans made directly in Telegram by another group administrator,
+    # not just bans issued by this bot's command/automation paths.
+    manually_banned = (update.chat.type in {"group", "supergroup"}
+                       and old.status in {"member", "restricted", "administrator"}
+                       and new.status == "kicked")
+    if manually_banned:
+        moderator = getattr(update, "from_user", None)
+        if moderator is not None and int(moderator.id) != int(bot.id):
+            try:
+                from ..services.ban_reports import report_successful_ban
+
+                await report_successful_ban(
+                    bot, session, chat_id=update.chat.id, target_id=user.id,
+                    actor_id=moderator.id,
+                    reason="دلیل بن در رویداد تلگرام در دسترس نیست.",
+                    source="telegram_manual", chat=update.chat,
+                    target=user, actor=moderator)
+            except Exception as exc:  # noqa: BLE001 - reporting must not block member tracking
+                logger.warning("manual-ban report failed (%s)", exc.__class__.__name__)
 
     # Every status change teaches the bot about a member (somebody who is
     # muted, promoted or restricted is often a member who never speaks).
