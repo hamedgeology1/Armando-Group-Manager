@@ -207,9 +207,9 @@ class ChatSettings(Base, TimestampMixin):
     goodbye_delete_after: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Legacy per-chat override is retained for schema compatibility; the global
-    # outgoing-message lifecycle now enforces a fixed twenty-second group TTL.
+    # outgoing-message lifecycle now enforces a fixed thirty-second group TTL.
     report_delete_after: Mapped[int] = mapped_column(
-        Integer, default=20, nullable=False, server_default="20")
+        Integer, default=30, nullable=False, server_default="30")
 
     # -------------------------------------------------------- service messages
     clean_join: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default=FALSE)

@@ -50,7 +50,7 @@ async def send_welcome(bot: Bot, session: AsyncSession, *, chat_id: int, user,
         buttons=settings_obj.welcome_buttons,
         context=context,
     )
-    # Outgoing group messages receive the application-wide 20-second TTL in
+    # Outgoing group messages receive the application-wide 30-second TTL in
     # the Bot API request middleware; no second per-welcome timer is needed.
     return message
 

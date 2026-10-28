@@ -21,7 +21,13 @@ from ..core import cache
 from ..core.errors import (safe_answer, safe_call, safe_delete, safe_edit,
                            safe_edit_markup, schedule_delete)
 from ..core.normalization import to_persian_digits
-from ..core.message_lifecycle import GROUP_BOT_MESSAGE_TTL
+from ..core.message_lifecycle import (
+    GROUP_BOT_MESSAGE_TTL,
+    is_management_panel_markup,
+    is_panel_message,
+    panel_message_context,
+    remember_panel_message,
+)
 from ..db.models import (
     BotRole,
     Chat,
@@ -119,7 +125,7 @@ RESET_DEFAULTS: dict[str, dict[str, object]] = {
     "filters": {"filter_default_action": "delete", "filter_default_mode": "word"},
     "rules": {"rules_text": "", "rules_enabled": True},
     "reports": {"report_enabled": True, "report_notify_admins": True,
-                 "report_delete_after": 20},
+                 "report_delete_after": 30},
     "trust": {"trust_bypass": None},
     "tags": {"tag_allow_user_edit": False},
     "logs": {"log_enabled": True, "log_chat_id": None},
@@ -408,18 +414,21 @@ async def send_panel(bot: Bot, chat_id: int, user_id: int, session: AsyncSession
     ctx = await _prepare_ctx(session, bot, target_chat_id, user_id, actor, settings, section,
                              chat_title=(chat.title if chat else ""), chat_type="group", **extra)
     text, keyboard = build_panel(section, ctx)
-    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard,
-                                  parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    # Initial group panels are explicitly exempt from the global 30-second TTL.
+    with panel_message_context():
+        sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard,
+                                      parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     if sent is not None:
+        remember_panel_message(sent.chat.id, sent.message_id)
         remember_panel_owner(chat_id, sent.message_id, user_id)
 
 
-PANEL_TTL = 24 * 60 * 60  # a day is plenty for an interactive panel
+PANEL_TTL = 24 * 60 * 60  # owner binding only; it does not expire the panel message
 
 
 def remember_panel_owner(chat_id: int, message_id: int, user_id: int) -> None:
     """Bind a panel message to the admin who opened it."""
-    cache.panel_owner_cache.set((chat_id, message_id), int(user_id))
+    cache.panel_owner_cache.set((chat_id, message_id), int(user_id), ttl=PANEL_TTL)
 
 
 def _panel_owner(chat_id: int, message_id: int) -> int | None:
@@ -840,7 +849,7 @@ async def on_set(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> No
     if not await _ensure_admin(callback, bot, chat_id, session):
         return
     if field == "report_delete_after":
-        await safe_answer(callback, "⏱ زمان حذف پیام‌های گروه ثابت و برابر ۲۰ ثانیه است.", show_alert=True)
+        await safe_answer(callback, "⏱ پیام‌های عادی گروه پس از ۳۰ ثانیه پاک می‌شوند؛ پنل مدیریتی باقی می‌ماند.", show_alert=True)
         return
     settings_obj = await get_settings(session, chat_id)
     if not hasattr(settings_obj, field):
@@ -880,7 +889,7 @@ async def on_number(callback: CallbackQuery, session: AsyncSession, bot: Bot) ->
     if not await _ensure_admin(callback, bot, chat_id, session):
         return
     if field == "report_delete_after":
-        await safe_answer(callback, "⏱ زمان حذف پیام‌های گروه ثابت و برابر ۲۰ ثانیه است.", show_alert=True)
+        await safe_answer(callback, "⏱ پیام‌های عادی گروه پس از ۳۰ ثانیه پاک می‌شوند؛ پنل مدیریتی باقی می‌ماند.", show_alert=True)
         return
     settings_obj = await get_settings(session, chat_id)
     current = int(getattr(settings_obj, field, 0) or 0)
@@ -2006,22 +2015,44 @@ async def on_root_access(callback: CallbackQuery, session: AsyncSession, bot: Bo
 
 @router.callback_query.middleware()
 async def panel_owner_middleware(handler, event: CallbackQuery, data: dict):
-    """A panel belongs to the admin who opened it - nobody else may click it.
+    """Keep group panels persistent and bound to the admin who opened them.
 
-    Every panel message is remembered when it is sent; clicking it from another
-    account is refused with an alert instead of silently changing the group.
+    A stale panel whose in-memory owner record was lost on restart is left on
+    screen but disabled; the admin can open a fresh panel. This avoids both a
+    disappearing panel and accidentally granting a stale keyboard to others.
     """
     message = getattr(event, "message", None)
     user = getattr(event, "from_user", None)
     if message is not None and user is not None:
-        owner = _panel_owner(message.chat.id, message.message_id)
-        if owner is not None and owner != user.id:
-            bot = data.get("bot")
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "message_id", None)
+        is_group = getattr(chat, "type", None) in {"group", "supergroup"}
+        panel_keyboard = is_management_panel_markup(getattr(message, "reply_markup", None))
+        known_panel = bool(chat_id is not None and message_id is not None
+                           and is_panel_message(chat_id, message_id))
+        group_panel = is_group and (panel_keyboard or known_panel)
+        if group_panel:
+            remember_panel_message(chat_id, message_id)
+
+        owner = _panel_owner(chat_id, message_id) if chat_id is not None and message_id is not None else None
+        bot = data.get("bot")
+        if group_panel and owner is None:
             if bot is not None:
                 await safe_call(
                     lambda: bot.answer_callback_query(
                         callback_query_id=event.id,
-                        text=("\U0001f512 این پنل مخصوص مدیری است که آن را باز کرده است.\n"
+                        text=("⌛ این پنل قدیمی است و برای امنیت غیرفعال مانده؛ "
+                              "در گروه دوباره دستور «پنل» را بزنید."),
+                        show_alert=True),
+                    default=None, context="stale_panel_denied")
+            return None
+        if owner is not None and owner != user.id:
+            if bot is not None:
+                await safe_call(
+                    lambda: bot.answer_callback_query(
+                        callback_query_id=event.id,
+                        text=("🔒 این پنل مخصوص مدیری است که آن را باز کرده است.\n"
                               "برای پنل خودتان در گروه دستور «پنل» را بزنید."),
                         show_alert=True),
                     default=None, context="panel_owner_denied")

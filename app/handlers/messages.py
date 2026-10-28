@@ -66,7 +66,7 @@ async def _notify(bot: Bot, chat_id: int, text: str, *, reply_to: int | None = N
     except Exception:  # noqa: BLE001
         return
 
-    # The session-level request middleware applies the fixed 20-second TTL to
+    # The session-level request middleware applies the fixed 30-second TTL to
     # every bot-authored message in groups, regardless of the old per-notice TTL.
 
 

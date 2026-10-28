@@ -100,7 +100,10 @@ class Settings:
     # ---------------------------------------------------------- MTProto scan
     telegram_api_id: int | None = None
     telegram_api_hash: str = ""
+    # Optional user-authorized MTProto session, stored only as a Railway Secret.
+    telegram_session_string: str = ""
     deleted_account_scan_interval: int = 86400
+    deleted_account_max_pages: int = 500
 
     # --------------------------------------------------------- Instagram media
     # Optional Base64 Netscape cookie file; only used in the owner's private chat.
@@ -194,8 +197,11 @@ class Settings:
             tokenrouter_default_model=(values.get("tokenrouter_default_model") or "").strip(),
             telegram_api_id=_as_int(values.get("telegram_api_id")),
             telegram_api_hash=(values.get("telegram_api_hash") or "").strip(),
+            telegram_session_string=(values.get("telegram_session_string") or "").strip(),
             deleted_account_scan_interval=max(
                 3600, _as_int(values.get("deleted_account_scan_interval")) or 86400),
+            deleted_account_max_pages=max(
+                1, min(2000, _as_int(values.get("deleted_account_max_pages")) or 500)),
             instagram_cookies_b64=(values.get("instagram_cookies_b64") or "").strip(),
             market_cache_ttl=_as_int(values.get("market_cache_ttl")) or 90,
             market_provider_order=(values.get("market_provider_order")
@@ -250,7 +256,8 @@ class Settings:
     def safe_dict(self) -> dict[str, Any]:
         """Dump for logs/backups - secrets are masked or removed."""
         secret_keys = {"bot_token", "ai_api_key", "ai_chat_api_key", "tokenrouter_api_key",
-                       "telegram_api_hash", "instagram_cookies_b64", "webhook_secret",
+                       "telegram_api_hash", "telegram_session_string",
+                       "instagram_cookies_b64", "webhook_secret",
                        "database_url", "redis_url"}
         data = {f.name: getattr(self, f.name) for f in fields(self)}
         for key in secret_keys:

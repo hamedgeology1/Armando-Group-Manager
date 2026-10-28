@@ -171,6 +171,19 @@ async def _migration_14(engine: AsyncEngine) -> None:
 
 MIGRATIONS[14] = _migration_14
 
+
+async def _migration_15(engine: AsyncEngine) -> None:
+    """Change the fixed global group-message TTL from 20 to 30 seconds."""
+    if await check_missing_columns(engine, "chat_settings", ["report_delete_after"]):
+        return
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "UPDATE chat_settings SET report_delete_after = 30 "
+            "WHERE report_delete_after <> 30"))
+
+
+MIGRATIONS[15] = _migration_15
+
 CURRENT_VERSION = max(MIGRATIONS) if MIGRATIONS else 0
 
 

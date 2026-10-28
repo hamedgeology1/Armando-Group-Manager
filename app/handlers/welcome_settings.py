@@ -130,7 +130,7 @@ async def cmd_welcome_off(ctx: CommandContext) -> None:
 async def cmd_welcome_autodelete(ctx: CommandContext) -> None:
     if not await require(ctx, role="admin", permission="manage"):
         return
-    await ctx.reply("⏱ حذف جداگانهٔ خوشامد غیرفعال است؛ همهٔ پیام‌های ربات در گروه پس از ۲۰ ثانیه پاک می‌شوند.")
+    await ctx.reply("⏱ حذف جداگانهٔ خوشامد غیرفعال است؛ پیام‌های عادی ربات در گروه پس از ۳۰ ثانیه پاک می‌شوند.")
 
 
 # --------------------------------------------------------------------------- #
